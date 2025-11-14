@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "langgraph-unity-catalog-checkpoint"
-version = "0.0.1"
+version = "0.0.2"
 description = "Unity Catalog-backed persistence for LangChain and LangGraph"
 readme = "README.md"
 license = "MIT"

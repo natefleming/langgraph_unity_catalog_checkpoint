@@ -266,21 +266,38 @@ class AsyncUnityCatalogCheckpointSaver(BaseUnityCatalogSaver):
         parent_checkpoint_id = config["configurable"].get("checkpoint_id")
 
         try:
-            # Store checkpoint blobs - collect all blobs and insert in a single batch
-            channel_values = checkpoint.pop("channel_values", {})
+            # Make a copy to avoid mutating the original checkpoint (following PostgreSQL pattern)
+            copy = checkpoint.copy()
+            copy["channel_values"] = copy["channel_values"].copy()
+            
+            # Separate inline primitive values from blob values (following PostgreSQL pattern)
+            # Inline: None, str, int, float, bool
+            # Blobs: everything else (lists, dicts, objects, etc.)
+            channel_values = copy["channel_values"]
+            blob_values = {}
+            inline_values = {}
+            
+            for k, v in channel_values.items():
+                if v is None or isinstance(v, (str, int, float, bool)):
+                    inline_values[k] = v
+                else:
+                    blob_values[k] = v
+            
+            # Store blobs in blobs table
             blob_tuples = list(
-                self._dump_blobs(thread_id, checkpoint_ns, channel_values, new_versions)
+                self._dump_blobs(thread_id, checkpoint_ns, blob_values, new_versions)
             )
             if blob_tuples:
                 await self._upsert_blobs_batch(blob_tuples)
 
-            # Store checkpoint
+            # Store checkpoint with inline primitive values only
+            copy["channel_values"] = inline_values
             await self._upsert_checkpoint(
                 thread_id,
                 checkpoint_ns,
                 checkpoint_id,
                 parent_checkpoint_id,
-                checkpoint,
+                copy,
                 metadata,
                 config,
             )
@@ -385,13 +402,16 @@ class AsyncUnityCatalogCheckpointSaver(BaseUnityCatalogSaver):
                 row[3],
             )
             type_ = row[4] if row[4] else "msgpack"
-            # Unity Catalog returns BINARY data as base64, not hex
-            checkpoint_bytes = base64.b64decode(row[5]) if row[5] else None
+            # Checkpoint is now stored as base64-encoded string
+            checkpoint_str = row[5] if row[5] else None
             metadata_str = row[6] if row[6] else "{}"
 
-            if not checkpoint_bytes:
+            if not checkpoint_str:
                 return None
 
+            # Decode base64 string to bytes
+            checkpoint_bytes = base64.b64decode(checkpoint_str)
+            
             # Deserialize checkpoint with correct type
             checkpoint_data = await asyncio.to_thread(
                 self.serde.loads_typed, (type_, checkpoint_bytes)
@@ -399,7 +419,7 @@ class AsyncUnityCatalogCheckpointSaver(BaseUnityCatalogSaver):
             metadata = json.loads(metadata_str) if metadata_str else {}
 
             # Load channel values from blobs
-            channel_values = await self._load_channel_values_async(
+            channel_values_from_blobs = await self._load_channel_values_async(
                 thread_id, checkpoint_ns, checkpoint_data
             )
 
@@ -408,6 +428,8 @@ class AsyncUnityCatalogCheckpointSaver(BaseUnityCatalogSaver):
                 thread_id, checkpoint_ns, checkpoint_id
             )
 
+            # Merge inline channel_values (primitives) with blob channel_values (complex objects)
+            # Following PostgreSQL pattern
             return CheckpointTuple(
                 config={
                     "configurable": {
@@ -418,7 +440,10 @@ class AsyncUnityCatalogCheckpointSaver(BaseUnityCatalogSaver):
                 },
                 checkpoint={
                     **checkpoint_data,
-                    "channel_values": channel_values,
+                    "channel_values": {
+                        **(checkpoint_data.get("channel_values") or {}),
+                        **channel_values_from_blobs,
+                    },
                 },
                 metadata=metadata,
                 parent_config=(
@@ -481,10 +506,10 @@ class AsyncUnityCatalogCheckpointSaver(BaseUnityCatalogSaver):
 
             result = {}
             for row in response.result.data_array:
-                channel, type_, blob_b64 = row[0], row[1], row[2]
-                if type_ != "empty" and blob_b64:
-                    # Unity Catalog returns BINARY data as base64
-                    blob = base64.b64decode(blob_b64)
+                channel, type_, blob_str = row[0], row[1], row[2]
+                if type_ != "empty" and blob_str:
+                    # Blob is stored as base64-encoded string
+                    blob = base64.b64decode(blob_str)
                     result[channel] = await asyncio.to_thread(self.serde.loads_typed, (type_, blob))
 
             return result
@@ -581,10 +606,19 @@ class AsyncUnityCatalogCheckpointSaver(BaseUnityCatalogSaver):
         if not blob_tuples:
             return
 
+        import base64
+
         # Build UNION ALL source rows for all blobs
         source_rows = []
         for thread_id, checkpoint_ns, channel, version, type_, blob in blob_tuples:
-            blob_hex = self._bytes_to_hex(blob) if blob else "NULL"
+            # Convert blob bytes to base64 string
+            if blob:
+                blob_str = base64.b64encode(blob).decode('utf-8')
+                blob_escaped = self._escape_string(blob_str)
+                blob_value = f"'{blob_escaped}'"
+            else:
+                blob_value = "NULL"
+            
             source_rows.append(f"""
             SELECT
                 '{self._escape_string(thread_id)}' AS thread_id,
@@ -592,7 +626,7 @@ class AsyncUnityCatalogCheckpointSaver(BaseUnityCatalogSaver):
                 '{self._escape_string(channel)}' AS channel,
                 '{self._escape_string(version)}' AS version,
                 '{self._escape_string(type_)}' AS type,
-                X'{blob_hex}' AS blob
+                {blob_value} AS blob
             """)
 
         source_query = " UNION ALL ".join(source_rows)
@@ -629,10 +663,17 @@ class AsyncUnityCatalogCheckpointSaver(BaseUnityCatalogSaver):
         config: RunnableConfig,
     ) -> None:
         """Upsert a checkpoint into the checkpoints table."""
+        import base64
+        
         type_, checkpoint_data = await asyncio.to_thread(self.serde.dumps_typed, checkpoint)
-        checkpoint_hex = self._bytes_to_hex(checkpoint_data)
+        # Store as base64-encoded string (easier to debug than binary)
+        checkpoint_str = base64.b64encode(checkpoint_data).decode('utf-8')
+        checkpoint_escaped = self._escape_string(checkpoint_str)
+        
         metadata_json = json.dumps(get_serializable_checkpoint_metadata(config, metadata))
         metadata_str = self._escape_string(metadata_json)
+        
+        type_escaped = self._escape_string(type_)
 
         query = f"""
         MERGE INTO {self.full_checkpoints_table} AS target
@@ -641,7 +682,8 @@ class AsyncUnityCatalogCheckpointSaver(BaseUnityCatalogSaver):
             '{self._escape_string(checkpoint_ns)}' AS checkpoint_ns,
             '{self._escape_string(checkpoint_id)}' AS checkpoint_id,
             {f"'{self._escape_string(parent_checkpoint_id)}'" if parent_checkpoint_id else "NULL"} AS parent_checkpoint_id,
-            X'{checkpoint_hex}' AS checkpoint,
+            '{type_escaped}' AS type,
+            '{checkpoint_escaped}' AS checkpoint,
             '{metadata_str}' AS metadata
         ) AS source
         ON target.thread_id = source.thread_id
@@ -649,14 +691,15 @@ class AsyncUnityCatalogCheckpointSaver(BaseUnityCatalogSaver):
             AND target.checkpoint_id = source.checkpoint_id
         WHEN MATCHED THEN UPDATE SET
             parent_checkpoint_id = source.parent_checkpoint_id,
+            type = source.type,
             checkpoint = source.checkpoint,
             metadata = source.metadata
         WHEN NOT MATCHED THEN INSERT (
-            thread_id, checkpoint_ns, checkpoint_id, parent_checkpoint_id, checkpoint, metadata
+            thread_id, checkpoint_ns, checkpoint_id, parent_checkpoint_id, type, checkpoint, metadata
         )
         VALUES (
             source.thread_id, source.checkpoint_ns, source.checkpoint_id,
-            source.parent_checkpoint_id, source.checkpoint, source.metadata
+            source.parent_checkpoint_id, source.type, source.checkpoint, source.metadata
         )
         """
 
@@ -672,6 +715,8 @@ class AsyncUnityCatalogCheckpointSaver(BaseUnityCatalogSaver):
         write_tuple: tuple[str, str, str, str, str, int, str, str, bytes],
     ) -> None:
         """Upsert a write into the checkpoint_writes table."""
+        import base64
+        
         (
             thread_id,
             checkpoint_ns,
@@ -684,7 +729,9 @@ class AsyncUnityCatalogCheckpointSaver(BaseUnityCatalogSaver):
             blob,
         ) = write_tuple
 
-        blob_hex = self._bytes_to_hex(blob)
+        blob_str = base64.b64encode(blob).decode('utf-8')
+        blob_escaped = self._escape_string(blob_str)
+        
         query = f"""
         MERGE INTO {self.full_writes_table} AS target
         USING (SELECT
@@ -696,7 +743,7 @@ class AsyncUnityCatalogCheckpointSaver(BaseUnityCatalogSaver):
             {idx} AS idx,
             '{self._escape_string(channel)}' AS channel,
             '{self._escape_string(type_)}' AS type,
-            X'{blob_hex}' AS blob
+            '{blob_escaped}' AS blob
         ) AS source
         ON target.thread_id = source.thread_id
             AND target.checkpoint_ns = source.checkpoint_ns
@@ -740,6 +787,8 @@ class AsyncUnityCatalogCheckpointSaver(BaseUnityCatalogSaver):
         if not write_tuples:
             return
 
+        import base64
+
         # Build UNION ALL source rows for all writes
         source_rows = []
         for (
@@ -753,7 +802,9 @@ class AsyncUnityCatalogCheckpointSaver(BaseUnityCatalogSaver):
             type_,
             blob,
         ) in write_tuples:
-            blob_hex = self._bytes_to_hex(blob)
+            blob_str = base64.b64encode(blob).decode('utf-8')
+            blob_escaped = self._escape_string(blob_str)
+            
             source_rows.append(f"""
             SELECT
                 '{self._escape_string(thread_id)}' AS thread_id,
@@ -764,7 +815,7 @@ class AsyncUnityCatalogCheckpointSaver(BaseUnityCatalogSaver):
                 {idx} AS idx,
                 '{self._escape_string(channel)}' AS channel,
                 '{self._escape_string(type_)}' AS type,
-                X'{blob_hex}' AS blob
+                '{blob_escaped}' AS blob
             """)
 
         source_query = " UNION ALL ".join(source_rows)

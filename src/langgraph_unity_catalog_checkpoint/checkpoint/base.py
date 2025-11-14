@@ -38,7 +38,7 @@ class BaseUnityCatalogSaver(BaseCheckpointSaver[str]):
         checkpoint_id STRING NOT NULL,
         parent_checkpoint_id STRING,
         type STRING,
-        checkpoint BINARY NOT NULL,
+        checkpoint STRING NOT NULL,
         metadata STRING NOT NULL DEFAULT '{{}}',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
         PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id)
@@ -47,7 +47,7 @@ class BaseUnityCatalogSaver(BaseCheckpointSaver[str]):
     TBLPROPERTIES (
         'delta.enableChangeDataFeed' = 'true',
         'delta.feature.allowColumnDefaults' = 'supported',
-        'description' = 'LangGraph checkpoint storage in Unity Catalog'
+        'description' = 'LangGraph checkpoint storage in Unity Catalog (JSON strings)'
     )
     """
 
@@ -58,7 +58,7 @@ class BaseUnityCatalogSaver(BaseCheckpointSaver[str]):
         channel STRING NOT NULL,
         version STRING NOT NULL,
         type STRING NOT NULL,
-        blob BINARY,
+        blob STRING,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
         PRIMARY KEY (thread_id, checkpoint_ns, channel, version)
     )
@@ -66,7 +66,7 @@ class BaseUnityCatalogSaver(BaseCheckpointSaver[str]):
     TBLPROPERTIES (
         'delta.enableChangeDataFeed' = 'true',
         'delta.feature.allowColumnDefaults' = 'supported',
-        'description' = 'LangGraph checkpoint blobs storage in Unity Catalog'
+        'description' = 'LangGraph checkpoint blobs storage in Unity Catalog (JSON strings)'
     )
     """
 
@@ -80,7 +80,7 @@ class BaseUnityCatalogSaver(BaseCheckpointSaver[str]):
         idx INT NOT NULL,
         channel STRING NOT NULL,
         type STRING,
-        blob BINARY NOT NULL,
+        blob STRING NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
         PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id, task_id, idx)
     )
@@ -88,7 +88,7 @@ class BaseUnityCatalogSaver(BaseCheckpointSaver[str]):
     TBLPROPERTIES (
         'delta.enableChangeDataFeed' = 'true',
         'delta.feature.allowColumnDefaults' = 'supported',
-        'description' = 'LangGraph checkpoint writes storage in Unity Catalog'
+        'description' = 'LangGraph checkpoint writes storage in Unity Catalog (JSON strings)'
     )
     """
 
@@ -171,9 +171,16 @@ class BaseUnityCatalogSaver(BaseCheckpointSaver[str]):
         """Escape a string for use in SQL."""
         return s.replace("'", "''")
 
-    def _bytes_to_hex(self, data: bytes) -> str:
-        """Convert bytes to hex string for BINARY column."""
-        return data.hex()
+    def _serialize_to_json_string(self, data: Any) -> str:
+        """Serialize data to JSON string for STRING column."""
+        import json
+        import base64
+        
+        # If data is bytes, base64 encode it first
+        if isinstance(data, bytes):
+            return base64.b64encode(data).decode('utf-8')
+        # Otherwise serialize as JSON
+        return json.dumps(data)
 
     def _load_blobs(self, blob_values: list[tuple[str, str, bytes]] | None) -> dict[str, Any]:
         """Load blobs from database rows.

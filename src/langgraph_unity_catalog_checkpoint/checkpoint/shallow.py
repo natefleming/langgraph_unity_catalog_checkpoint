@@ -225,7 +225,7 @@ class ShallowUnityCatalogSaver(BaseUnityCatalogSaver):
                 metadata = eval(row[3]) if row[3] else {}  # metadata
 
                 # Load channel values from blobs
-                channel_values = self._load_channel_values(
+                channel_values_from_blobs = self._load_channel_values(
                     thread_id, checkpoint_ns, checkpoint_data
                 )
 
@@ -234,6 +234,8 @@ class ShallowUnityCatalogSaver(BaseUnityCatalogSaver):
                     thread_id, checkpoint_ns, checkpoint_data.get("id", "")
                 )
 
+                # Merge inline channel_values (primitives) with blob channel_values (complex objects)
+                # Following PostgreSQL pattern
                 yield CheckpointTuple(
                     config={
                         "configurable": {
@@ -244,7 +246,10 @@ class ShallowUnityCatalogSaver(BaseUnityCatalogSaver):
                     },
                     checkpoint={
                         **checkpoint_data,
-                        "channel_values": channel_values,
+                        "channel_values": {
+                            **(checkpoint_data.get("channel_values") or {}),
+                            **channel_values_from_blobs,
+                        },
                     },
                     metadata=metadata,
                     parent_config=None,  # Shallow doesn't track parents
@@ -405,12 +410,34 @@ class ShallowUnityCatalogSaver(BaseUnityCatalogSaver):
             )
             _ = response.result
 
+            # Make a copy to avoid mutating the original checkpoint (following PostgreSQL pattern)
+            copy = checkpoint.copy()
+            copy["channel_values"] = copy["channel_values"].copy()
+            
+            # Separate inline primitive values from blob values (following PostgreSQL pattern)
+            channel_values = copy["channel_values"]
+            blob_values = {}
+            inline_values = {}
+            
+            for k, v in channel_values.items():
+                if v is None or isinstance(v, (str, int, float, bool)):
+                    inline_values[k] = v
+                else:
+                    blob_values[k] = v
+            
             # Upsert blobs
-            channel_values = checkpoint.pop("channel_values", {})
+            import base64
+            
             for thread_id_, checkpoint_ns_, channel, type_, blob in self._dump_blobs(
-                thread_id, checkpoint_ns, channel_values, new_versions
+                thread_id, checkpoint_ns, blob_values, new_versions
             ):
-                blob_hex = self._bytes_to_hex(blob) if blob else "NULL"
+                if blob:
+                    blob_str = base64.b64encode(blob).decode('utf-8')
+                    blob_escaped = self._escape_string(blob_str)
+                    blob_value = f"'{blob_escaped}'"
+                else:
+                    blob_value = "NULL"
+                    
                 upsert_blob_sql = f"""
                 MERGE INTO {self.full_checkpoint_blobs_table} AS target
                 USING (SELECT
@@ -418,7 +445,7 @@ class ShallowUnityCatalogSaver(BaseUnityCatalogSaver):
                     '{self._escape_string(checkpoint_ns_)}' AS checkpoint_ns,
                     '{self._escape_string(channel)}' AS channel,
                     '{self._escape_string(type_)}' AS type,
-                    X'{blob_hex}' AS blob
+                    {blob_value} AS blob
                 ) AS source
                 ON target.thread_id = source.thread_id
                     AND target.checkpoint_ns = source.checkpoint_ns
@@ -436,19 +463,24 @@ class ShallowUnityCatalogSaver(BaseUnityCatalogSaver):
                 )
                 _ = response.result
 
-            # Upsert checkpoint
-            checkpoint_data = self.serde.dumps(checkpoint)
-            checkpoint_hex = self._bytes_to_hex(checkpoint_data)
-            metadata_str = str(get_serializable_checkpoint_metadata(config, metadata)).replace(
-                "'", "''"
-            )
+            # Upsert checkpoint with inline primitive values only
+            import base64
+            import json
+            
+            copy["channel_values"] = inline_values
+            checkpoint_data = self.serde.dumps(copy)
+            checkpoint_str = base64.b64encode(checkpoint_data).decode('utf-8')
+            checkpoint_escaped = self._escape_string(checkpoint_str)
+            
+            metadata_json = json.dumps(get_serializable_checkpoint_metadata(config, metadata))
+            metadata_str = self._escape_string(metadata_json)
 
             upsert_checkpoint_sql = f"""
             MERGE INTO {self.full_checkpoints_table} AS target
             USING (SELECT
                 '{self._escape_string(thread_id)}' AS thread_id,
                 '{self._escape_string(checkpoint_ns)}' AS checkpoint_ns,
-                X'{checkpoint_hex}' AS checkpoint,
+                '{checkpoint_escaped}' AS checkpoint,
                 '{metadata_str}' AS metadata
             ) AS source
             ON target.thread_id = source.thread_id
@@ -515,7 +547,10 @@ class ShallowUnityCatalogSaver(BaseUnityCatalogSaver):
                     blob,
                 ) = params
 
-                blob_hex = self._bytes_to_hex(blob)
+                import base64
+                blob_str = base64.b64encode(blob).decode('utf-8')
+                blob_escaped = self._escape_string(blob_str)
+                
                 insert_write_sql = f"""
                 MERGE INTO {self.full_writes_table} AS target
                 USING (SELECT
@@ -527,7 +562,7 @@ class ShallowUnityCatalogSaver(BaseUnityCatalogSaver):
                     {idx} AS idx,
                     '{self._escape_string(channel)}' AS channel,
                     '{self._escape_string(type_)}' AS type,
-                    X'{blob_hex}' AS blob
+                    '{blob_escaped}' AS blob
                 ) AS source
                 ON target.thread_id = source.thread_id
                     AND target.checkpoint_ns = source.checkpoint_ns
