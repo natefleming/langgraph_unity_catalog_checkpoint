@@ -8,30 +8,23 @@
 #   2. For local development: Build wheel with `python -m build` and install from dist/
 #   3. For production: Publish to PyPI or use wheel file paths
 
-environment_version: '4'
+environment_version: "4"
 dependencies:
   - --index-url https://pypi.org/simple
   # Core Dependencies (matching pyproject.toml)
-  - databricks-connect>=17.0.10
-  - databricks-langchain>=0.9.0
   - databricks-sdk>=0.73.0
   - langchain>=1.0.3
   - langgraph>=1.0.2
-  - langmem>=0.0.30
   - loguru>=0.7.3
-  - mlflow==3.5.1
-  - nest-asyncio>=1.6.0
-  - python-dotenv>=1.2.1
-  
+
   # Unity Catalog Persistence
   # Option 1: Install from PyPI (when published)
   # - langgraph-unity-catalog-checkpoint
-  
+
   # Option 2: Install from wheel file (for development/testing)
   # Uncomment and update path as needed:
   # - /Workspace/path/to/langgraph_unity_catalog_checkpoint-0.1.0-py3-none-any.whl
   # - /Volumes/catalog/schema/volume/langgraph_unity_catalog_checkpoint-0.1.0-py3-none-any.whl
-  
+
   # Option 3: Install from git repository (private repos require auth)
   # - git+https://github.com/your-org/langgraph-unity-catalog-checkpoint.git
-

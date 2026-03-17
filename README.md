@@ -1,6 +1,6 @@
 # LangGraph Unity Catalog Checkpoint
 
-[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 **Production-ready Unity Catalog persistence for LangChain and LangGraph applications using Databricks as the storage backend.**
@@ -31,7 +31,7 @@ All implementations use Databricks Unity Catalog Delta tables via the WorkspaceC
 
 ### Prerequisites
 
-- Python 3.12+
+- Python 3.10+
 - Databricks workspace with Unity Catalog enabled
 - SQL warehouse with appropriate permissions
 
@@ -47,8 +47,7 @@ This will automatically install all required dependencies including:
 - `databricks-sdk`
 - `langchain`
 - `langgraph`
-- `langmem`
-- `databricks-langchain`
+- `loguru`
 
 ### Install from Source
 
